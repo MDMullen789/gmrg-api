@@ -6,7 +6,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
-app.get('/', (req, res) => { res.json({ status: 'GMRG API running', version: '2.0.0' }); });
+app.get('/', (req, res) => { res.json({ status: 'GMRG API running', version: '2.1.0' }); });
 app.post('/api/claude', async (req, res) => {
   try {
     const apiKey = process.env.ANTHROPIC_API_KEY;
@@ -29,47 +29,29 @@ app.post('/api/publish', async (req, res) => {
   try {
     const netlifyToken = process.env.NETLIFY_TOKEN;
     if (!netlifyToken) return res.status(500).json({ error: 'NETLIFY_TOKEN not configured' });
-    const { html, siteName } = req.body;
+    const { html } = req.body;
     if (!html) return res.status(400).json({ error: 'Missing html' });
-    const slug = (siteName || 'gmrg-tour').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60);
-    console.log(`[Publish] Creating site: ${slug}`);
-    let site;
-    const siteRes = await fetch('https://api.netlify.com/api/v1/sites', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${netlifyToken}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: slug })
-    });
-    if (!siteRes.ok) {
-      const ts = Date.now().toString().slice(-5);
-      const siteRes2 = await fetch('https://api.netlify.com/api/v1/sites', {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${netlifyToken}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: `${slug}-${ts}` })
-      });
-      if (!siteRes2.ok) throw new Error('Failed to create site: ' + (await siteRes2.text()).slice(0, 200));
-      site = await siteRes2.json();
-    } else {
-      site = await siteRes.json();
-    }
-    const siteId = site.id;
-    const siteUrl = site.ssl_url || site.url;
+    const SITE_ID = 'd347dd58-9399-40bb-beb7-673190bc3226';
     const htmlBuffer = Buffer.from(html, 'utf8');
     const sha1 = crypto.createHash('sha1').update(htmlBuffer).digest('hex');
-    const deployRes = await fetch(`https://api.netlify.com/api/v1/sites/${siteId}/deploys`, {
+    console.log('[Publish] Creating deploy on gmrglibrary...');
+    const deployRes = await fetch(`https://api.netlify.com/api/v1/sites/${SITE_ID}/deploys`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${netlifyToken}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ files: { '/index.html': sha1 } })
     });
-    if (!deployRes.ok) throw new Error('Failed to create deploy: ' + (await deployRes.text()).slice(0, 200));
+    if (!deployRes.ok) throw new Error('Deploy failed: ' + (await deployRes.text()).slice(0, 300));
     const deploy = await deployRes.json();
+    console.log('[Publish] Deploy created: ' + deploy.id);
     const uploadRes = await fetch(`https://api.netlify.com/api/v1/deploys/${deploy.id}/files/index.html`, {
       method: 'PUT',
       headers: { 'Authorization': `Bearer ${netlifyToken}`, 'Content-Type': 'application/octet-stream' },
       body: htmlBuffer
     });
-    if (!uploadRes.ok) throw new Error('Failed to upload: ' + (await uploadRes.text()).slice(0, 200));
-    console.log(`[Publish] Live at: ${siteUrl}`);
-    res.json({ url: siteUrl, siteId, deployId: deploy.id });
+    if (!uploadRes.ok) throw new Error('Upload failed: ' + (await uploadRes.text()).slice(0, 300));
+    const deployUrl = `https://${deploy.id}--gmrglibrary.netlify.app`;
+    console.log('[Publish] Live at: ' + deployUrl);
+    res.json({ url: deployUrl, deployId: deploy.id });
   } catch (err) {
     console.error('[Publish] Error:', err.message);
     res.status(500).json({ error: err.message });
