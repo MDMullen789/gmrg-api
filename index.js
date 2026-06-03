@@ -6,7 +6,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
-app.get('/', (req, res) => { res.json({ status: 'GMRG API running', version: '2.1.0' }); });
+app.get('/', (req, res) => { res.json({ status: 'GMRG API running', version: '2.2.0' }); });
 app.post('/api/claude', async (req, res) => {
   try {
     const apiKey = process.env.ANTHROPIC_API_KEY;
@@ -16,12 +16,9 @@ app.post('/api/claude', async (req, res) => {
     if (!model || !max_tokens || !messages) return res.status(400).json({ error: 'Missing required fields' });
     const params = { model, max_tokens, messages };
     if (system) params.system = system;
-    console.log(`[Claude] model=${model} max_tokens=${max_tokens}`);
     const response = await client.messages.create(params);
-    console.log(`[Claude] done stop_reason=${response.stop_reason} tokens=${response.usage?.output_tokens}`);
     res.json(response);
   } catch (err) {
-    console.error('[Claude] Error:', err.message);
     res.status(err.status || 500).json({ error: err.message });
   }
 });
@@ -34,7 +31,6 @@ app.post('/api/publish', async (req, res) => {
     const SITE_ID = 'd347dd58-9399-40bb-beb7-673190bc3226';
     const htmlBuffer = Buffer.from(html, 'utf8');
     const sha1 = crypto.createHash('sha1').update(htmlBuffer).digest('hex');
-    console.log('[Publish] Creating deploy on gmrglibrary...');
     const deployRes = await fetch(`https://api.netlify.com/api/v1/sites/${SITE_ID}/deploys`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${netlifyToken}`, 'Content-Type': 'application/json' },
@@ -42,7 +38,6 @@ app.post('/api/publish', async (req, res) => {
     });
     if (!deployRes.ok) throw new Error('Deploy failed: ' + (await deployRes.text()).slice(0, 300));
     const deploy = await deployRes.json();
-    console.log('[Publish] Deploy created: ' + deploy.id);
     const uploadRes = await fetch(`https://api.netlify.com/api/v1/deploys/${deploy.id}/files/index.html`, {
       method: 'PUT',
       headers: { 'Authorization': `Bearer ${netlifyToken}`, 'Content-Type': 'application/octet-stream' },
@@ -53,7 +48,6 @@ app.post('/api/publish', async (req, res) => {
     console.log('[Publish] Live at: ' + deployUrl);
     res.json({ url: deployUrl, deployId: deploy.id });
   } catch (err) {
-    console.error('[Publish] Error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
