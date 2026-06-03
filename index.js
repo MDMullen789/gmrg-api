@@ -6,7 +6,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
-app.get('/', (req, res) => { res.json({ status: 'GMRG API running', version: '2.2.0' }); });
+app.get('/', (req, res) => { res.json({ status: 'GMRG API running', version: '2.3.0' }); });
 app.post('/api/claude', async (req, res) => {
   try {
     const apiKey = process.env.ANTHROPIC_API_KEY;
@@ -28,7 +28,7 @@ app.post('/api/publish', async (req, res) => {
     if (!netlifyToken) return res.status(500).json({ error: 'NETLIFY_TOKEN not configured' });
     const { html } = req.body;
     if (!html) return res.status(400).json({ error: 'Missing html' });
-    const SITE_ID = 'd347dd58-9399-40bb-beb7-673190bc3226';
+    const SITE_ID = '14b53164-9a16-4780-a8c1-b3011256e6ca';
     const htmlBuffer = Buffer.from(html, 'utf8');
     const sha1 = crypto.createHash('sha1').update(htmlBuffer).digest('hex');
     const deployRes = await fetch(`https://api.netlify.com/api/v1/sites/${SITE_ID}/deploys`, {
@@ -44,7 +44,7 @@ app.post('/api/publish', async (req, res) => {
       body: htmlBuffer
     });
     if (!uploadRes.ok) throw new Error('Upload failed: ' + (await uploadRes.text()).slice(0, 300));
-    const deployUrl = `https://${deploy.id}--gmrglibrary.netlify.app`;
+    const deployUrl = `https://${deploy.id}--gmrg-tours.netlify.app`;
     console.log('[Publish] Live at: ' + deployUrl);
     res.json({ url: deployUrl, deployId: deploy.id });
   } catch (err) {
