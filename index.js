@@ -28,7 +28,7 @@ app.post('/api/publish', async (req, res) => {
     if (!netlifyToken) return res.status(500).json({ error: 'NETLIFY_TOKEN not configured' });
     const { html } = req.body;
     if (!html) return res.status(400).json({ error: 'Missing html' });
-    const SITE_ID = '37f92e58-15f1-4d56-9ec3-c49c12b9581b';
+    const SITE_ID = 'da1e01aa-f682-48e5-a12a-93ca34c493be';
     const htmlBuffer = Buffer.from(html, 'utf8');
     const sha1 = crypto.createHash('sha1').update(htmlBuffer).digest('hex');
     const deployRes = await fetch(`https://api.netlify.com/api/v1/sites/${SITE_ID}/deploys`, {
