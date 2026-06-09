@@ -32,7 +32,8 @@ app.post('/api/publish', async (req, res) => {
     const createRes = await fetch('https://api.netlify.com/api/v1/sites', {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${netlifyToken}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: slug, account_slug: 'gina-mullen-realty-group' })
+      const uniqueSlug = slug + "-" + Math.random().toString(36).slice(2,6);
+    body: JSON.stringify({ name: uniqueSlug, account_slug: 'gina-mullen-realty-group' })
     });
     const createText = await createRes.text();
     if (!createRes.ok) return res.status(500).json({ error: 'Site creation failed (' + createRes.status + '): ' + createText.slice(0, 200) });
