@@ -6,7 +6,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
-app.get('/', (req, res) => { res.json({ status: 'GMRG API running', version: '2.3.2' }); });
+app.get('/', (req, res) => { res.json({ status: 'GMRG API running', version: '2.5.0' }); });
 app.post('/api/claude', async (req, res) => {
   try {
     const apiKey = process.env.ANTHROPIC_API_KEY;
@@ -26,27 +26,37 @@ app.post('/api/publish', async (req, res) => {
   try {
     const netlifyToken = process.env.NETLIFY_TOKEN;
     if (!netlifyToken) return res.status(500).json({ error: 'NETLIFY_TOKEN not configured' });
-    const { html } = req.body;
+    const { html, siteName } = req.body;
     if (!html) return res.status(400).json({ error: 'Missing html' });
-    const SITE_ID = 'da1e01aa-f682-48e5-a12a-93ca34c493be';
+    const slug = (siteName || 'gmrg-listing').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60);
+    const createRes = await fetch('https://api.netlify.com/api/v1/sites', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${netlifyToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: slug, account_slug: 'gina-mullen-realty-group' })
+    });
+    const createText = await createRes.text();
+    if (!createRes.ok) return res.status(500).json({ error: 'Site creation failed (' + createRes.status + '): ' + createText.slice(0, 200) });
+    const site = JSON.parse(createText);
+    const siteId = site.id;
+    const siteDomain = site.default_domain || `${slug}.netlify.app`;
     const htmlBuffer = Buffer.from(html, 'utf8');
     const sha1 = crypto.createHash('sha1').update(htmlBuffer).digest('hex');
-    const deployRes = await fetch(`https://api.netlify.com/api/v1/sites/${SITE_ID}/deploys`, {
+    const deployRes = await fetch(`https://api.netlify.com/api/v1/sites/${siteId}/deploys`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${netlifyToken}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ files: { '/index.html': sha1 } })
     });
-    if (!deployRes.ok) throw new Error('Deploy failed: ' + (await deployRes.text()).slice(0, 300));
+    if (!deployRes.ok) return res.status(500).json({ error: 'Deploy failed: ' + (await deployRes.text()).slice(0, 200) });
     const deploy = await deployRes.json();
     const uploadRes = await fetch(`https://api.netlify.com/api/v1/deploys/${deploy.id}/files/index.html`, {
       method: 'PUT',
       headers: { 'Authorization': `Bearer ${netlifyToken}`, 'Content-Type': 'application/octet-stream' },
       body: htmlBuffer
     });
-    if (!uploadRes.ok) throw new Error('Upload failed: ' + (await uploadRes.text()).slice(0, 300));
-    const deployUrl = `https://${deploy.id}--gmrg-tours.netlify.app`;
-    console.log('[Publish] Live at: ' + deployUrl);
-    res.json({ url: deployUrl, deployId: deploy.id });
+    if (!uploadRes.ok) return res.status(500).json({ error: 'Upload failed: ' + (await uploadRes.text()).slice(0, 200) });
+    const url = `https://${siteDomain}`;
+    console.log('[Publish] Live at: ' + url + ' | Site: ' + siteId);
+    res.json({ url, siteId });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
