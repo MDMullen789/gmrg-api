@@ -48,6 +48,116 @@ app.post('/api/claude', async (req, res) => {
   }
 });
 
+// ── NETLIFY PUBLISH ────────────────────────────────────────────
+// Publishing used to happen in the browser with a Netlify token embedded in
+// the dashboard HTML (anyone could read it via View Source). The token now
+// lives only here, in Railway's NETLIFY_TOKEN variable.
+const crypto = require('crypto');
+const NETLIFY_API = 'https://api.netlify.com/api/v1';
+const NETLIFY_TEAM = 'gina-mullen-realty-group';
+const PUBLISH_TARGETS = {
+  tours:   { siteId: 'da1e01aa-f682-48e5-a12a-93ca34c493be' },  // gmrg-tours
+  updates: { siteId: '3d1c0551-5546-4f7a-ae9e-08c9fbd84629' },  // gmrg-updates
+  listing: { newSite: true }                                     // one site per listing
+};
+const PUBLISH_ORIGINS = [/^https:\/\/gmrglibrary\.netlify\.app$/, /^https:\/\/[a-z0-9-]+--gmrglibrary\.netlify\.app$/];
+const MAX_FILES = 60;
+const MAX_TOTAL_BYTES = 40 * 1024 * 1024;
+
+// Simple in-memory limiter: 20 publishes per 10 minutes per IP.
+const publishHits = new Map();
+function publishRateLimited(ip) {
+  const now = Date.now(), win = 10 * 60 * 1000;
+  const hits = (publishHits.get(ip) || []).filter(t => now - t < win);
+  hits.push(now); publishHits.set(ip, hits);
+  return hits.length > 20;
+}
+
+async function netlify(path, opts, token) {
+  const r = await fetch(NETLIFY_API + path, {
+    ...opts,
+    headers: { Authorization: 'Bearer ' + token, ...(opts.headers || {}) }
+  });
+  const text = await r.text();
+  if (!r.ok) {
+    const err = new Error('Netlify ' + r.status + ': ' + text.slice(0, 200));
+    err.status = 502;
+    throw err;
+  }
+  return text ? JSON.parse(text) : {};
+}
+
+// Body: { target: 'tours'|'updates'|'listing', files: { '/index.html': { content, encoding: 'utf8'|'base64' } },
+//         draft?: boolean, slug?: string }
+// Returns: { deployId, deployUrl, siteUrl }
+app.post('/api/publish', async (req, res) => {
+  try {
+    const origin = req.get('origin') || '';
+    if (!PUBLISH_ORIGINS.some(re => re.test(origin))) return res.status(403).json({ error: 'Origin not allowed' });
+    if (publishRateLimited(req.ip)) return res.status(429).json({ error: 'Too many publishes — try again in a few minutes' });
+
+    const token = process.env.NETLIFY_TOKEN;
+    if (!token) return res.status(500).json({ error: 'NETLIFY_TOKEN not configured on server' });
+
+    const { target, files, draft, slug } = req.body || {};
+    const cfg = PUBLISH_TARGETS[target];
+    if (!cfg) return res.status(400).json({ error: 'Unknown publish target' });
+    if (!files || typeof files !== 'object') return res.status(400).json({ error: 'Missing files' });
+
+    // Decode + validate files, build the SHA1 manifest Netlify expects.
+    const buffers = {}, manifest = {};
+    let total = 0;
+    const paths = Object.keys(files);
+    if (!paths.length || paths.length > MAX_FILES) return res.status(400).json({ error: 'Between 1 and ' + MAX_FILES + ' files allowed' });
+    for (const path of paths) {
+      if (!/^\/[A-Za-z0-9._\-\/]+$/.test(path) || path.includes('..')) return res.status(400).json({ error: 'Bad file path: ' + path });
+      const f = files[path];
+      if (!f || typeof f.content !== 'string') return res.status(400).json({ error: 'Bad file: ' + path });
+      const buf = Buffer.from(f.content, f.encoding === 'base64' ? 'base64' : 'utf8');
+      total += buf.length;
+      buffers[path] = buf;
+      manifest[path] = crypto.createHash('sha1').update(buf).digest('hex');
+    }
+    if (total > MAX_TOTAL_BYTES) return res.status(413).json({ error: 'Publish too large' });
+
+    // Resolve the site (existing, or a new one for listings — always under the paid team).
+    let siteId = cfg.siteId, siteUrl = null;
+    if (cfg.newSite) {
+      const base = String(slug || 'listing').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 45) || 'listing';
+      const name = 'gmrg-' + base + '-' + crypto.randomBytes(2).toString('hex');
+      const site = await netlify('/' + NETLIFY_TEAM + '/sites', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name })
+      }, token);
+      siteId = site.id;
+      siteUrl = 'https://' + (site.default_domain || name + '.netlify.app');
+    }
+
+    const deploy = await netlify('/sites/' + siteId + '/deploys', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ files: manifest, draft: !!draft })
+    }, token);
+
+    // Upload only the files Netlify doesn't already have.
+    const required = new Set(deploy.required || []);
+    for (const path of paths) {
+      if (required.size && !required.has(manifest[path])) continue;
+      await netlify('/deploys/' + deploy.id + '/files' + path, {
+        method: 'PUT', headers: { 'Content-Type': 'application/octet-stream' }, body: buffers[path]
+      }, token);
+    }
+
+    console.log(`[Publish] target=${target} files=${paths.length} bytes=${total} deploy=${deploy.id}`);
+    res.json({
+      deployId: deploy.id,
+      deployUrl: deploy.deploy_ssl_url || deploy.ssl_url,
+      siteUrl: siteUrl || deploy.ssl_url
+    });
+  } catch (err) {
+    console.error('[Publish] Error:', err.message);
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+
 // ── START ──────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`GMRG API server running on port ${PORT}`);
