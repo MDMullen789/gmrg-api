@@ -205,8 +205,13 @@ app.get('/api/live-price', async (req, res) => {
     const pm = keywords.match(/\$\s?([\d,]{4,})/);
     const price = pm ? parseInt(pm[1].replace(/,/g, ''), 10) : null;
     const status = (keywords.split(',')[0] || '').trim(); // e.g. "For sale", "Pending", "Sold"
+    // Address as the page states it, so callers can confirm the MLS# landed on the right home
+    const parts = keywords.split(',').map(x => x.trim());
+    const ai = parts.findIndex(x => /^\d+[A-Za-z]?\s+\S/.test(x) && !/sq\.?\s*ft/i.test(x));
+    const address = ai >= 0 ? parts[ai] : '';
+    const city = ai >= 0 ? (parts[ai + 1] || '') : '';
 
-    const data = { price, status, checkedAt: new Date(now).toISOString() };
+    const data = { price, status, address, city, checkedAt: new Date(now).toISOString() };
     if (price) livePriceCache.set(key, { at: now, data });
     console.log(`[LivePrice] ${key} price=${price} status="${status}"`);
     res.json(data);
