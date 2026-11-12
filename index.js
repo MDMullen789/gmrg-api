@@ -99,7 +99,7 @@ app.post('/api/publish', async (req, res) => {
     const token = process.env.NETLIFY_TOKEN;
     if (!token) return res.status(500).json({ error: 'NETLIFY_TOKEN not configured on server' });
 
-    const { target, files, draft, slug } = req.body || {};
+    const { target, files, draft, slug, existingUrl } = req.body || {};
     const cfg = PUBLISH_TARGETS[target];
     if (!cfg) return res.status(400).json({ error: 'Unknown publish target' });
     if (!files || typeof files !== 'object') return res.status(400).json({ error: 'Missing files' });
@@ -122,7 +122,19 @@ app.post('/api/publish', async (req, res) => {
 
     // Resolve the site (existing, or a new one for listings — always under the paid team).
     let siteId = cfg.siteId, siteUrl = null;
-    if (cfg.newSite) {
+    if (cfg.newSite && existingUrl) {
+      // Republish onto an existing listing page (e.g. Private Listing -> Active) so the link stays the same.
+      let host;
+      try { host = new URL(String(existingUrl)).hostname.toLowerCase(); } catch (e) { return res.status(400).json({ error: 'Existing link is not a valid URL' }); }
+      const m = host.match(/^(?:[a-z0-9]+--)?(gmrg-[a-z0-9-]+)\.netlify\.app$/);
+      if (!m) return res.status(400).json({ error: 'Existing link must be a published listing page (gmrg-….netlify.app)' });
+      const site = await netlify('/sites/' + m[1] + '.netlify.app', { method: 'GET' }, token);
+      if (!site || !site.id || site.account_slug !== NETLIFY_TEAM || !String(site.name || '').startsWith('gmrg-')) {
+        return res.status(403).json({ error: 'That page is not a GMRG listing page' });
+      }
+      siteId = site.id;
+      siteUrl = site.ssl_url || ('https://' + site.default_domain);
+    } else if (cfg.newSite) {
       const base = String(slug || 'listing').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 45) || 'listing';
       const name = 'gmrg-' + base + '-' + crypto.randomBytes(2).toString('hex');
       const site = await netlify('/' + NETLIFY_TEAM + '/sites', {
