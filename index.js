@@ -216,6 +216,42 @@ app.get('/api/live-price', async (req, res) => {
   }
 });
 
+// ── SCHOOL ZONING LOOKUP ───────────────────────────────────────
+// Used by the Listing Summary's Private Listing mode. Rules live in schools.js.
+const { lookupSchools } = require('./schools');
+const schoolCache = new Map(); // address key -> { at, data }
+const schoolHits = new Map();
+app.post('/api/schools', async (req, res) => {
+  try {
+    const origin = req.get('origin') || '';
+    if (!PUBLISH_ORIGINS.some(re => re.test(origin))) return res.status(403).json({ error: 'Origin not allowed' });
+
+    const now = Date.now();
+    const hits = (schoolHits.get(req.ip) || []).filter(t => now - t < 10 * 60 * 1000);
+    hits.push(now); schoolHits.set(req.ip, hits);
+    if (hits.length > 15) return res.status(429).json({ error: 'Too many lookups — try again in a few minutes' });
+
+    const clean = v => String(v || '').replace(/[\r\n]+/g, ' ').trim().slice(0, 160);
+    const input = { address: clean(req.body.address), city: clean(req.body.city), zip: clean(req.body.zip), subdivision: clean(req.body.subdivision) };
+    if (!input.address || !(input.city || input.zip)) return res.status(400).json({ error: 'Address with city or ZIP required' });
+
+    const key = [input.address, input.city, input.zip].join('|').toLowerCase().replace(/\s+/g, ' ');
+    const cached = schoolCache.get(key);
+    if (cached && now - cached.at < 24 * 60 * 60 * 1000) return res.json(cached.data);
+
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured on server' });
+    const data = await lookupSchools(new Anthropic({ apiKey }), input);
+    data.checkedAt = new Date(now).toISOString();
+    if (data.records.length) schoolCache.set(key, { at: now, data });
+    console.log(`[Schools] ${key} records=${data.records.length} elem=${data.elementary.status} mid=${data.middle.status} high=${data.high.status}`);
+    res.json(data);
+  } catch (err) {
+    console.error('[Schools] Error:', err.message);
+    res.status(err.status || 502).json({ error: err.message || 'School lookup failed' });
+  }
+});
+
 // ── START ──────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`GMRG API server running on port ${PORT}`);
