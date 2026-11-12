@@ -252,6 +252,83 @@ app.post('/api/schools', async (req, res) => {
   }
 });
 
+// ── ADDRESS SEARCH (Google Places API (New)) ───────────────────
+// Autocomplete + details for the Listing Summary address field. The key lives
+// only in Railway's GOOGLE_MAPS_KEY. Uses session tokens so each pick is billed
+// as one Place Details Essentials call (10,000 free per month).
+const PLACES = 'https://places.googleapis.com/v1';
+const placesHits = new Map();
+function placesGuard(req, res) {
+  const origin = req.get('origin') || '';
+  if (!PUBLISH_ORIGINS.some(re => re.test(origin))) { res.status(403).json({ error: 'Origin not allowed' }); return null; }
+  const now = Date.now();
+  const hits = (placesHits.get(req.ip) || []).filter(t => now - t < 10 * 60 * 1000);
+  hits.push(now); placesHits.set(req.ip, hits);
+  if (hits.length > 400) { res.status(429).json({ error: 'Too many requests' }); return null; }
+  const key = process.env.GOOGLE_MAPS_KEY;
+  if (!key) { res.status(503).json({ error: 'Address search not configured' }); return null; }
+  return key;
+}
+const token = v => String(v || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 64);
+
+app.get('/api/places/autocomplete', async (req, res) => {
+  const key = placesGuard(req, res); if (!key) return;
+  const input = String(req.query.q || '').trim().slice(0, 120);
+  if (input.length < 3) return res.json({ suggestions: [] });
+  try {
+    const r = await fetch(PLACES + '/places:autocomplete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Goog-Api-Key': key },
+      body: JSON.stringify({
+        input,
+        sessionToken: token(req.query.session) || undefined,
+        includedRegionCodes: ['us'],
+        includedPrimaryTypes: ['street_address', 'premise', 'subpremise'],
+        // Bias toward North Texas (Denton County, 50 km — the max Google allows)
+        locationBias: { circle: { center: { latitude: 33.2, longitude: -97.13 }, radius: 50000 } }
+      })
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error?.message || ('Google returned ' + r.status));
+    res.json({ suggestions: (j.suggestions || []).filter(s => s.placePrediction).map(s => ({
+      id: s.placePrediction.placeId,
+      main: s.placePrediction.structuredFormat?.mainText?.text || s.placePrediction.text?.text || '',
+      secondary: s.placePrediction.structuredFormat?.secondaryText?.text || ''
+    })) });
+  } catch (err) {
+    console.error('[Places] autocomplete:', err.message);
+    res.status(502).json({ error: err.message });
+  }
+});
+
+app.get('/api/places/details', async (req, res) => {
+  const key = placesGuard(req, res); if (!key) return;
+  const id = String(req.query.id || '').replace(/[^A-Za-z0-9_-]/g, '');
+  if (!id) return res.status(400).json({ error: 'Missing id' });
+  try {
+    const qs = token(req.query.session) ? '?sessionToken=' + token(req.query.session) : '';
+    const r = await fetch(PLACES + '/places/' + id + qs, {
+      headers: { 'X-Goog-Api-Key': key, 'X-Goog-FieldMask': 'addressComponents,formattedAddress' }
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error?.message || ('Google returned ' + r.status));
+    const get = (type, short) => { const c = (j.addressComponents || []).find(c => (c.types || []).includes(type)); return c ? (short ? c.shortText : c.longText) : ''; };
+    const street = [get('street_number', true), get('route', true)].filter(Boolean).join(' ');
+    res.json({
+      street,
+      city: get('locality') || get('sublocality') || get('postal_town'),
+      state: get('administrative_area_level_1', true),
+      zip: get('postal_code'),
+      county: get('administrative_area_level_2'),
+      neighborhood: get('neighborhood'),
+      formatted: j.formattedAddress || ''
+    });
+  } catch (err) {
+    console.error('[Places] details:', err.message);
+    res.status(502).json({ error: err.message });
+  }
+});
+
 // ── START ──────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`GMRG API server running on port ${PORT}`);
