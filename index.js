@@ -252,9 +252,9 @@ app.post('/api/schools', async (req, res) => {
   }
 });
 
-// ── ADDRESS SEARCH (Google Places API (New)) ───────────────────
-// Autocomplete + details for the Listing Summary address field. The key lives
-// only in Railway's GOOGLE_MAPS_KEY. Uses session tokens so each pick is billed
+// ── ADDRESS SEARCH ─────────────────────────────────────────────
+// Autocomplete for the Listing Summary address field. Free Photon (OpenStreetMap)
+// by default; Google Places API (New) if GOOGLE_MAPS_KEY is set in Railway. Uses session tokens so each pick is billed
 // as one Place Details Essentials call (10,000 free per month).
 const PLACES = 'https://places.googleapis.com/v1';
 const placesHits = new Map();
@@ -265,9 +265,42 @@ function placesGuard(req, res) {
   const hits = (placesHits.get(req.ip) || []).filter(t => now - t < 10 * 60 * 1000);
   hits.push(now); placesHits.set(req.ip, hits);
   if (hits.length > 400) { res.status(429).json({ error: 'Too many requests' }); return null; }
-  const key = process.env.GOOGLE_MAPS_KEY;
-  if (!key) { res.status(503).json({ error: 'Address search not configured' }); return null; }
-  return key;
+  return process.env.GOOGLE_MAPS_KEY || 'photon';
+}
+
+// Free fallback when there's no Google key: Photon (OpenStreetMap), limited to Texas.
+// If OSM has the street but not the house, the typed house number is put in front,
+// so "2309 chebi" still becomes "2309 Chebi Ln, Denton, TX 76209".
+const USPS = { lane: 'Ln', court: 'Ct', drive: 'Dr', road: 'Rd', street: 'St', boulevard: 'Blvd', avenue: 'Ave', circle: 'Cir',
+  trail: 'Trl', place: 'Pl', parkway: 'Pkwy', terrace: 'Ter', cove: 'Cv', crossing: 'Xing', highway: 'Hwy', way: 'Way', point: 'Pt',
+  north: 'N', south: 'S', east: 'E', west: 'W' };
+const abbr = s => String(s || '').replace(/\b(Lane|Court|Drive|Road|Street|Boulevard|Avenue|Circle|Trail|Place|Parkway|Terrace|Cove|Crossing|Highway|Point)$/i, m => USPS[m.toLowerCase()])
+  .replace(/^(North|South|East|West)\b/i, m => USPS[m.toLowerCase()]);
+async function photonSearch(input) {
+  const num = (input.match(/^\s*(\d+[A-Za-z]?)\s+/) || [])[1] || '';
+  const url = 'https://photon.komoot.io/api/?' + new URLSearchParams({ q: input, limit: '10', lang: 'en', lat: '33.2', lon: '-97.13', bbox: '-106.65,25.84,-93.51,36.5' });
+  const r = await fetch(url, { headers: { 'User-Agent': 'GMRG-AgentLibrary/1.0 (+https://gmrglibrary.netlify.app)' } });
+  if (!r.ok) throw new Error('Address search returned ' + r.status);
+  const j = await r.json();
+  const seen = new Set(), out = [];
+  for (const f of j.features || []) {
+    const p = f.properties || {};
+    if (p.state && p.state !== 'Texas') continue;
+    const isHouse = !!p.housenumber;
+    const isStreet = !isHouse && p.osm_key === 'highway';
+    if (!isHouse && !isStreet) continue;
+    const road = abbr(isHouse ? p.street : p.name);
+    const house = isHouse ? p.housenumber : num;
+    if (!road || !house) continue;
+    const street = house + ' ' + road;
+    const city = p.city || p.town || p.village || p.district || p.county || '';
+    const key = (street + city).toLowerCase();
+    if (seen.has(key)) continue; seen.add(key);
+    out.push({ id: '', main: street, secondary: [city, 'TX'].filter(Boolean).join(', ') + (p.postcode ? ' ' + p.postcode : ''),
+      address: { street, city, state: 'TX', zip: p.postcode || '', neighborhood: '' } });
+    if (out.length >= 6) break;
+  }
+  return out;
 }
 const token = v => String(v || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 64);
 
@@ -276,6 +309,7 @@ app.get('/api/places/autocomplete', async (req, res) => {
   const input = String(req.query.q || '').trim().slice(0, 120);
   if (input.length < 3) return res.json({ suggestions: [] });
   try {
+    if (key === 'photon') return res.json({ suggestions: await photonSearch(input), source: 'photon' });
     const r = await fetch(PLACES + '/places:autocomplete', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Goog-Api-Key': key },
@@ -290,7 +324,7 @@ app.get('/api/places/autocomplete', async (req, res) => {
     });
     const j = await r.json();
     if (!r.ok) throw new Error(j.error?.message || ('Google returned ' + r.status));
-    res.json({ suggestions: (j.suggestions || []).filter(s => s.placePrediction).map(s => ({
+    res.json({ source: 'google', suggestions: (j.suggestions || []).filter(s => s.placePrediction).map(s => ({
       id: s.placePrediction.placeId,
       main: s.placePrediction.structuredFormat?.mainText?.text || s.placePrediction.text?.text || '',
       secondary: s.placePrediction.structuredFormat?.secondaryText?.text || ''
@@ -303,6 +337,7 @@ app.get('/api/places/autocomplete', async (req, res) => {
 
 app.get('/api/places/details', async (req, res) => {
   const key = placesGuard(req, res); if (!key) return;
+  if (key === 'photon') return res.status(400).json({ error: 'Details not needed for this source' });
   const id = String(req.query.id || '').replace(/[^A-Za-z0-9_-]/g, '');
   if (!id) return res.status(400).json({ error: 'Missing id' });
   try {
