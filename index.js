@@ -158,6 +158,52 @@ app.post('/api/publish', async (req, res) => {
   }
 });
 
+// ── LIVE PRICE (from ginamullen.com IDX listing pages) ─────────
+// Listing summary pages call this on load to show the current price.
+// Reads the listing page's <meta name="keywords"> e.g.
+//   "For sale, beds 5, bath 5, 6839 sq. ft, 901 Hat Creek Ct, Bartonville, TX 76226, $3859000"
+const livePriceCache = new Map(); // url -> { at, data }
+const livePriceHits = new Map();
+app.get('/api/live-price', async (req, res) => {
+  try {
+    const now = Date.now();
+    const hits = (livePriceHits.get(req.ip) || []).filter(t => now - t < 10 * 60 * 1000);
+    hits.push(now); livePriceHits.set(req.ip, hits);
+    if (hits.length > 120) return res.status(429).json({ error: 'Too many requests' });
+
+    let url;
+    try { url = new URL(String(req.query.url || '')); } catch (e) { return res.status(400).json({ error: 'Bad url' }); }
+    if (url.protocol !== 'https:' || !/^(www\.)?ginamullen\.com$/i.test(url.hostname) || !url.pathname.startsWith('/search/')) {
+      return res.status(400).json({ error: 'Only ginamullen.com listing pages are supported' });
+    }
+    const key = url.origin + url.pathname;
+    const cached = livePriceCache.get(key);
+    if (cached && now - cached.at < 30 * 60 * 1000) return res.json(cached.data);
+
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 8000);
+    const r = await fetch(key, { signal: ctrl.signal, headers: { 'User-Agent': 'GMRG-AgentLibrary/1.0 (+https://gmrglibrary.netlify.app)' } });
+    clearTimeout(timer);
+    if (!r.ok) return res.status(502).json({ error: 'Listing page returned ' + r.status });
+    const html = await r.text();
+
+    const m = html.match(/<meta[^>]+name=["']keywords["'][^>]*content=["']([^"']*)["']/i) ||
+              html.match(/<meta[^>]+content=["']([^"']*)["'][^>]*name=["']keywords["']/i);
+    const keywords = m ? m[1] : '';
+    const pm = keywords.match(/\$\s?([\d,]{4,})/);
+    const price = pm ? parseInt(pm[1].replace(/,/g, ''), 10) : null;
+    const status = (keywords.split(',')[0] || '').trim(); // e.g. "For sale", "Pending", "Sold"
+
+    const data = { price, status, checkedAt: new Date(now).toISOString() };
+    if (price) livePriceCache.set(key, { at: now, data });
+    console.log(`[LivePrice] ${key} price=${price} status="${status}"`);
+    res.json(data);
+  } catch (err) {
+    console.error('[LivePrice] Error:', err.message);
+    res.status(502).json({ error: 'Could not read listing page' });
+  }
+});
+
 // ── START ──────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`GMRG API server running on port ${PORT}`);
