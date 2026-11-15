@@ -87,6 +87,31 @@ async function netlify(path, opts, token) {
   return text ? JSON.parse(text) : {};
 }
 
+// Resolve which Netlify site a publish goes to: the fixed site for tours/updates,
+// an existing listing site (republish, same link), or a new listing site.
+async function resolveSite(cfg, { slug, existingUrl }, token) {
+  if (cfg.newSite && existingUrl) {
+    let host;
+    try { host = new URL(String(existingUrl)).hostname.toLowerCase(); } catch (e) { return { status: 400, error: 'Existing link is not a valid URL' }; }
+    const m = host.match(/^(?:[a-z0-9]+--)?(gmrg-[a-z0-9-]+)\.netlify\.app$/);
+    if (!m) return { status: 400, error: 'Existing link must be a published listing page (gmrg-….netlify.app)' };
+    const site = await netlify('/sites/' + m[1] + '.netlify.app', { method: 'GET' }, token);
+    if (!site || !site.id || site.account_slug !== NETLIFY_TEAM || !String(site.name || '').startsWith('gmrg-')) {
+      return { status: 403, error: 'That page is not a GMRG listing page' };
+    }
+    return { siteId: site.id, siteUrl: site.ssl_url || ('https://' + site.default_domain) };
+  }
+  if (cfg.newSite) {
+    const base = String(slug || 'listing').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 45) || 'listing';
+    const name = 'gmrg-' + base + '-' + crypto.randomBytes(2).toString('hex');
+    const site = await netlify('/' + NETLIFY_TEAM + '/sites', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name })
+    }, token);
+    return { siteId: site.id, siteUrl: 'https://' + (site.default_domain || name + '.netlify.app') };
+  }
+  return { siteId: cfg.siteId, siteUrl: null };
+}
+
 // Body: { target: 'tours'|'updates'|'listing', files: { '/index.html': { content, encoding: 'utf8'|'base64' } },
 //         draft?: boolean, slug?: string }
 // Returns: { deployId, deployUrl, siteUrl }
@@ -120,29 +145,9 @@ app.post('/api/publish', async (req, res) => {
     }
     if (total > MAX_TOTAL_BYTES) return res.status(413).json({ error: 'Publish too large' });
 
-    // Resolve the site (existing, or a new one for listings — always under the paid team).
-    let siteId = cfg.siteId, siteUrl = null;
-    if (cfg.newSite && existingUrl) {
-      // Republish onto an existing listing page (e.g. Private Listing -> Active) so the link stays the same.
-      let host;
-      try { host = new URL(String(existingUrl)).hostname.toLowerCase(); } catch (e) { return res.status(400).json({ error: 'Existing link is not a valid URL' }); }
-      const m = host.match(/^(?:[a-z0-9]+--)?(gmrg-[a-z0-9-]+)\.netlify\.app$/);
-      if (!m) return res.status(400).json({ error: 'Existing link must be a published listing page (gmrg-….netlify.app)' });
-      const site = await netlify('/sites/' + m[1] + '.netlify.app', { method: 'GET' }, token);
-      if (!site || !site.id || site.account_slug !== NETLIFY_TEAM || !String(site.name || '').startsWith('gmrg-')) {
-        return res.status(403).json({ error: 'That page is not a GMRG listing page' });
-      }
-      siteId = site.id;
-      siteUrl = site.ssl_url || ('https://' + site.default_domain);
-    } else if (cfg.newSite) {
-      const base = String(slug || 'listing').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 45) || 'listing';
-      const name = 'gmrg-' + base + '-' + crypto.randomBytes(2).toString('hex');
-      const site = await netlify('/' + NETLIFY_TEAM + '/sites', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name })
-      }, token);
-      siteId = site.id;
-      siteUrl = 'https://' + (site.default_domain || name + '.netlify.app');
-    }
+    const site = await resolveSite(cfg, { slug, existingUrl }, token);
+    if (site.error) return res.status(site.status).json({ error: site.error });
+    const siteId = site.siteId, siteUrl = site.siteUrl;
 
     const deploy = await netlify('/sites/' + siteId + '/deploys', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -166,6 +171,120 @@ app.post('/api/publish', async (req, res) => {
     });
   } catch (err) {
     console.error('[Publish] Error:', err.message);
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+
+// ── PUBLISH, ONE FILE AT A TIME ────────────────────────────────
+// Same result as /api/publish, but each file travels in its own request, so a
+// tour with large disclosure packets isn't limited by one request's size.
+//   1. POST /api/publish/start  { target, manifest: { path: { sha1, size } }, draft?, slug?, existingUrl? }
+//        -> { deployId, required: [paths to upload], siteUrl, deployUrl }
+//   2. PUT  /api/publish/file?deploy=ID&path=/x   (raw bytes, one file, up to 100 MB)
+//   3. POST /api/publish/finish { deployId }      -> { deployId, deployUrl, siteUrl, state }
+// /api/publish stays as-is; the dashboard falls back to it if these aren't available.
+const MAX_FILE_BYTES = 100 * 1024 * 1024;
+const MAX_CHUNKED_FILES = 200;
+const MAX_CHUNKED_TOTAL = 600 * 1024 * 1024;
+const publishSessions = new Map(); // deployId -> { expires, files: { path: { sha1, size } }, siteUrl, deployUrl }
+function originOk(req) { return PUBLISH_ORIGINS.some(re => re.test(req.get('origin') || '')); }
+function sweepSessions() { const now = Date.now(); for (const [k, v] of publishSessions) if (v.expires < now) publishSessions.delete(k); }
+
+app.post('/api/publish/start', async (req, res) => {
+  try {
+    if (!originOk(req)) return res.status(403).json({ error: 'Origin not allowed' });
+    if (publishRateLimited(req.ip)) return res.status(429).json({ error: 'Too many publishes — try again in a few minutes' });
+    const token = process.env.NETLIFY_TOKEN;
+    if (!token) return res.status(500).json({ error: 'NETLIFY_TOKEN not configured on server' });
+
+    const { target, manifest, draft, slug, existingUrl } = req.body || {};
+    const cfg = PUBLISH_TARGETS[target];
+    if (!cfg) return res.status(400).json({ error: 'Unknown publish target' });
+    const paths = Object.keys(manifest || {});
+    if (!paths.length || paths.length > MAX_CHUNKED_FILES) return res.status(400).json({ error: 'Between 1 and ' + MAX_CHUNKED_FILES + ' files allowed' });
+    let total = 0;
+    const files = {}, shaManifest = {};
+    for (const path of paths) {
+      if (!/^\/[A-Za-z0-9._\-\/]+$/.test(path) || path.includes('..')) return res.status(400).json({ error: 'Bad file path: ' + path });
+      const f = manifest[path] || {};
+      if (!/^[a-f0-9]{40}$/.test(f.sha1 || '') || !Number.isInteger(f.size) || f.size < 0) return res.status(400).json({ error: 'Bad manifest entry: ' + path });
+      if (f.size > MAX_FILE_BYTES) return res.status(413).json({ error: path.split('/').pop() + ' is over 100 MB' });
+      total += f.size;
+      files[path] = { sha1: f.sha1, size: f.size };
+      shaManifest[path] = f.sha1;
+    }
+    if (total > MAX_CHUNKED_TOTAL) return res.status(413).json({ error: 'Publish too large (over 600 MB)' });
+
+    const site = await resolveSite(cfg, { slug, existingUrl }, token);
+    if (site.error) return res.status(site.status).json({ error: site.error });
+
+    const deploy = await netlify('/sites/' + site.siteId + '/deploys', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ files: shaManifest, draft: !!draft })
+    }, token);
+
+    // Netlify lists the file fingerprints it still needs; send back one path per fingerprint.
+    const needed = new Set(deploy.required || []), required = [], seen = new Set();
+    for (const path of paths) {
+      const sha = files[path].sha1;
+      if (needed.has(sha) && !seen.has(sha)) { required.push(path); seen.add(sha); }
+    }
+    sweepSessions();
+    publishSessions.set(deploy.id, {
+      expires: Date.now() + 60 * 60 * 1000, files,
+      siteUrl: site.siteUrl || deploy.ssl_url, deployUrl: deploy.deploy_ssl_url || deploy.ssl_url
+    });
+    console.log(`[Publish/start] target=${target} files=${paths.length} bytes=${total} upload=${required.length} deploy=${deploy.id}`);
+    res.json({ deployId: deploy.id, required, siteUrl: site.siteUrl || deploy.ssl_url, deployUrl: deploy.deploy_ssl_url || deploy.ssl_url });
+  } catch (err) {
+    console.error('[Publish/start] Error:', err.message);
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+
+app.put('/api/publish/file', express.raw({ type: () => true, limit: MAX_FILE_BYTES }), async (req, res) => {
+  try {
+    if (!originOk(req)) return res.status(403).json({ error: 'Origin not allowed' });
+    const token = process.env.NETLIFY_TOKEN;
+    const session = publishSessions.get(String(req.query.deploy || ''));
+    if (!session || session.expires < Date.now()) return res.status(404).json({ error: 'Publish session expired — publish again' });
+    const path = String(req.query.path || '');
+    const expected = session.files[path];
+    if (!expected) return res.status(400).json({ error: 'File not part of this publish: ' + path });
+    const buf = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+    const sha1 = crypto.createHash('sha1').update(buf).digest('hex');
+    if (buf.length !== expected.size || sha1 !== expected.sha1) return res.status(400).json({ error: 'File changed or arrived incomplete: ' + path });
+    await netlify('/deploys/' + req.query.deploy + '/files' + path, {
+      method: 'PUT', headers: { 'Content-Type': 'application/octet-stream' }, body: buf
+    }, token);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[Publish/file] Error:', err.message);
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+
+app.post('/api/publish/finish', async (req, res) => {
+  try {
+    if (!originOk(req)) return res.status(403).json({ error: 'Origin not allowed' });
+    const token = process.env.NETLIFY_TOKEN;
+    const deployId = String((req.body || {}).deployId || '');
+    const session = publishSessions.get(deployId);
+    if (!session) return res.status(404).json({ error: 'Publish session expired — publish again' });
+    // Netlify finishes processing on its own once every file is in; wait briefly for "ready".
+    let state = 'processing';
+    for (let i = 0; i < 20; i++) {
+      const d = await netlify('/deploys/' + deployId, { method: 'GET' }, token);
+      state = d.state;
+      if (state === 'ready' || state === 'error') break;
+      await new Promise(r => setTimeout(r, 1500));
+    }
+    publishSessions.delete(deployId);
+    if (state === 'error') return res.status(502).json({ error: 'Netlify could not finish the deploy' });
+    console.log(`[Publish/finish] deploy=${deployId} state=${state}`);
+    res.json({ deployId, deployUrl: session.deployUrl, siteUrl: session.siteUrl, state });
+  } catch (err) {
+    console.error('[Publish/finish] Error:', err.message);
     res.status(err.status || 500).json({ error: err.message });
   }
 });
