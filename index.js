@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const Anthropic = require('@anthropic-ai/sdk');
+const { requireSignIn } = require('./auth');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -15,7 +16,7 @@ app.get('/', (req, res) => {
 });
 
 // ── ANTHROPIC PROXY ────────────────────────────────────────────
-app.post('/api/claude', async (req, res) => {
+app.post('/api/claude', requireSignIn, async (req, res) => {
   try {
     const apiKey = process.env.ANTHROPIC_API_KEY;
     if (!apiKey) {
@@ -115,7 +116,7 @@ async function resolveSite(cfg, { slug, existingUrl }, token) {
 // Body: { target: 'tours'|'updates'|'listing', files: { '/index.html': { content, encoding: 'utf8'|'base64' } },
 //         draft?: boolean, slug?: string }
 // Returns: { deployId, deployUrl, siteUrl }
-app.post('/api/publish', async (req, res) => {
+app.post('/api/publish', requireSignIn, async (req, res) => {
   try {
     const origin = req.get('origin') || '';
     if (!PUBLISH_ORIGINS.some(re => re.test(origin))) return res.status(403).json({ error: 'Origin not allowed' });
@@ -190,7 +191,7 @@ const publishSessions = new Map(); // deployId -> { expires, files: { path: { sh
 function originOk(req) { return PUBLISH_ORIGINS.some(re => re.test(req.get('origin') || '')); }
 function sweepSessions() { const now = Date.now(); for (const [k, v] of publishSessions) if (v.expires < now) publishSessions.delete(k); }
 
-app.post('/api/publish/start', async (req, res) => {
+app.post('/api/publish/start', requireSignIn, async (req, res) => {
   try {
     if (!originOk(req)) return res.status(403).json({ error: 'Origin not allowed' });
     if (publishRateLimited(req.ip)) return res.status(429).json({ error: 'Too many publishes — try again in a few minutes' });
@@ -242,7 +243,7 @@ app.post('/api/publish/start', async (req, res) => {
   }
 });
 
-app.put('/api/publish/file', express.raw({ type: () => true, limit: MAX_FILE_BYTES }), async (req, res) => {
+app.put('/api/publish/file', requireSignIn, express.raw({ type: () => true, limit: MAX_FILE_BYTES }), async (req, res) => {
   try {
     if (!originOk(req)) return res.status(403).json({ error: 'Origin not allowed' });
     const token = process.env.NETLIFY_TOKEN;
@@ -264,7 +265,7 @@ app.put('/api/publish/file', express.raw({ type: () => true, limit: MAX_FILE_BYT
   }
 });
 
-app.post('/api/publish/finish', async (req, res) => {
+app.post('/api/publish/finish', requireSignIn, async (req, res) => {
   try {
     if (!originOk(req)) return res.status(403).json({ error: 'Origin not allowed' });
     const token = process.env.NETLIFY_TOKEN;
@@ -345,7 +346,7 @@ app.get('/api/live-price', async (req, res) => {
 const { lookupSchools } = require('./schools');
 const schoolCache = new Map(); // address key -> { at, data }
 const schoolHits = new Map();
-app.post('/api/schools', async (req, res) => {
+app.post('/api/schools', requireSignIn, async (req, res) => {
   try {
     const origin = req.get('origin') || '';
     if (!PUBLISH_ORIGINS.some(re => re.test(origin))) return res.status(403).json({ error: 'Origin not allowed' });
@@ -428,7 +429,7 @@ async function photonSearch(input) {
 }
 const token = v => String(v || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 64);
 
-app.get('/api/places/autocomplete', async (req, res) => {
+app.get('/api/places/autocomplete', requireSignIn, async (req, res) => {
   const key = placesGuard(req, res); if (!key) return;
   const input = String(req.query.q || '').trim().slice(0, 120);
   if (input.length < 3) return res.json({ suggestions: [] });
@@ -459,7 +460,7 @@ app.get('/api/places/autocomplete', async (req, res) => {
   }
 });
 
-app.get('/api/places/details', async (req, res) => {
+app.get('/api/places/details', requireSignIn, async (req, res) => {
   const key = placesGuard(req, res); if (!key) return;
   if (key === 'photon') return res.status(400).json({ error: 'Details not needed for this source' });
   const id = String(req.query.id || '').replace(/[^A-Za-z0-9_-]/g, '');
