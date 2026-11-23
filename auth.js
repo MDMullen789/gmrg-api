@@ -83,4 +83,10 @@ async function requireSignIn(req, res, next) {
   return next();
 }
 
-module.exports = { requireSignIn, verifyIdToken };
+// Same check, but a sign-in is always required (used for deleting pages), whatever REQUIRE_AUTH says.
+function requireSignInAlways(req, res, next) {
+  if (!/^Bearer\s+.+$/i.test(req.headers.authorization || '')) return res.status(401).json({ error: 'Please sign in to the Agent Library first.' });
+  return requireSignIn(req, res, next);
+}
+
+module.exports = { requireSignIn, requireSignInAlways, verifyIdToken, PROJECT };
