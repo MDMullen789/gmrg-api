@@ -1,7 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const Anthropic = require('@anthropic-ai/sdk');
-const { requireSignIn } = require('./auth');
+const { requireSignIn, requireSignInAlways, PROJECT: FIREBASE_PROJECT } = require('./auth');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -87,6 +87,69 @@ async function netlify(path, opts, token) {
   }
   return text ? JSON.parse(text) : {};
 }
+
+// ── DELETE A PUBLISHED PAGE ─────────────────────────────────────
+// Body: { id }  (the page's library id, e.g. tour-…, listing-gmrg-…, update-…)
+// The library record is read from Firestore WITH THE AGENT'S OWN TOKEN, so Firestore's rules decide
+// whether they may touch it (their own page, or any page if they're an admin). Then:
+//   tour / update  → delete that one deploy from gmrg-tours / gmrg-updates (never the site, never the front page)
+//   listing        → delete the listing's own gmrg-… site
+// Removing the library record is left to the browser (it has the same rights).
+const PROTECTED_SITES = new Set(['gmrg-tours', 'gmrg-updates', 'gmrglibrary', 'gmrg-api']);
+app.post('/api/unpublish', requireSignInAlways, async (req, res) => {
+  try {
+    const origin = req.get('origin') || '';
+    if (!PUBLISH_ORIGINS.some(re => re.test(origin))) return res.status(403).json({ error: 'Origin not allowed' });
+    const id = String((req.body && req.body.id) || '');
+    if (!/^[A-Za-z0-9_-]{3,120}$/.test(id)) return res.status(400).json({ error: 'Missing page id' });
+    const idToken = req.headers.authorization.replace(/^Bearer\s+/i, '');
+    const fr = await fetch('https://firestore.googleapis.com/v1/projects/' + FIREBASE_PROJECT + '/databases/(default)/documents/pages/' + encodeURIComponent(id),
+      { headers: { Authorization: 'Bearer ' + idToken } });
+    if (fr.status === 403 || fr.status === 404) return res.status(403).json({ error: 'That page isn’t in your library.' });
+    if (!fr.ok) return res.status(503).json({ error: 'Couldn’t check the library. Try again in a minute.' });
+    const f = ((await fr.json()).fields) || {};
+    const type = f.type && f.type.stringValue, url = f.url && f.url.stringValue;
+    let host;
+    try { host = new URL(url).hostname.toLowerCase(); } catch (e) { return res.status(400).json({ error: 'This library entry has no valid link.' }); }
+    const token = process.env.NETLIFY_TOKEN;
+    if (!token) return res.status(500).json({ error: 'NETLIFY_TOKEN not configured' });
+
+    if (type === 'tour' || type === 'update') {
+      const siteName = type === 'tour' ? 'gmrg-tours' : 'gmrg-updates';
+      const siteId = PUBLISH_TARGETS[type === 'tour' ? 'tours' : 'updates'].siteId;
+      const m = host.match(/^([a-f0-9]{24})--([a-z0-9-]+)\.netlify\.app$/);
+      if (!m || m[2] !== siteName) return res.status(400).json({ error: 'This link isn’t a ' + type + ' page this tool can delete. Delete it in Netlify instead.' });
+      const site = await netlify('/sites/' + siteId, { method: 'GET' }, token);
+      if (site.published_deploy && site.published_deploy.id === m[1]) {
+        return res.status(409).json({ error: 'This is the current front page of ' + siteName + '. Use “Clear public front pages” on the Team page first.' });
+      }
+      const r = await fetch(NETLIFY_API + '/sites/' + siteId + '/deploys/' + m[1], { method: 'DELETE', headers: { Authorization: 'Bearer ' + token } });
+      if (r.status === 404) return res.json({ deleted: true, alreadyGone: true });
+      if (!r.ok) return res.status(502).json({ error: 'Netlify refused (' + r.status + '): ' + (await r.text()).slice(0, 160) });
+      console.log('[unpublish]', req.agent && req.agent.email, type, m[1]);
+      return res.json({ deleted: true });
+    }
+
+    if (type === 'listing') {
+      const m = host.match(/^(?:[a-f0-9]{24}--)?(gmrg-[a-z0-9-]+)\.netlify\.app$/);
+      if (!m || PROTECTED_SITES.has(m[1])) return res.status(400).json({ error: 'This link isn’t a listing page this tool can delete.' });
+      let site;
+      try { site = await netlify('/sites/' + m[1] + '.netlify.app', { method: 'GET' }, token); }
+      catch (e) { return res.json({ deleted: true, alreadyGone: true }); }
+      if (!site || !site.id || site.account_slug !== NETLIFY_TEAM || !String(site.name || '').startsWith('gmrg-') || PROTECTED_SITES.has(site.name)) {
+        return res.status(403).json({ error: 'That page isn’t a GMRG listing page.' });
+      }
+      const r = await fetch(NETLIFY_API + '/sites/' + site.id, { method: 'DELETE', headers: { Authorization: 'Bearer ' + token } });
+      if (!r.ok && r.status !== 404) return res.status(502).json({ error: 'Netlify refused (' + r.status + '): ' + (await r.text()).slice(0, 160) });
+      console.log('[unpublish]', req.agent && req.agent.email, 'listing', site.name);
+      return res.json({ deleted: true });
+    }
+    return res.status(400).json({ error: 'Unknown page type.' });
+  } catch (e) {
+    console.error('[unpublish]', e.message);
+    return res.status(e.status || 500).json({ error: e.message || 'Delete failed' });
+  }
+});
 
 // Resolve which Netlify site a publish goes to: the fixed site for tours/updates,
 // an existing listing site (republish, same link), or a new listing site.
